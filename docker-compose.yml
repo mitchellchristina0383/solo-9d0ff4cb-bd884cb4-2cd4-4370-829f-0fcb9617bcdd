@@ -1,0 +1,27 @@
+# Two independent service processes (app1, app2) sharing ONE SQLite database
+# file on a named volume, mirroring the "two processes, one legacy database"
+# requirement. SQLite file locking works because the volume is a local
+# filesystem shared by containers on the same host (do NOT use NFS).
+services:
+  app1:
+    build: .
+    environment:
+      DB_PATH: /data/app.db
+      SERVER_NAME: app1
+    volumes:
+      - dbdata:/data
+    ports:
+      - "8001:8000"
+
+  app2:
+    build: .
+    environment:
+      DB_PATH: /data/app.db
+      SERVER_NAME: app2
+    volumes:
+      - dbdata:/data
+    ports:
+      - "8002:8000"
+
+volumes:
+  dbdata:
