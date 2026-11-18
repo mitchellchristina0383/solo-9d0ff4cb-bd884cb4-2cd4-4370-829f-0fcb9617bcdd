@@ -9,7 +9,7 @@ export DB_PATH="$RUN_DIR/app.db"
 
 start_one() {
   local name="$1" port="$2"
-  SERVER_NAME="$name" nohup python3 -m uvicorn app.main:app \
+  SERVER_NAME="$name" nohup "${PYTHON:-python3}" -m uvicorn app.main:app \
       --host 127.0.0.1 --port "$port" > "$RUN_DIR/$name.log" 2>&1 &
   echo $! > "$RUN_DIR/$name.pid"
   echo "$name pid $(cat "$RUN_DIR/$name.pid") on :$port"

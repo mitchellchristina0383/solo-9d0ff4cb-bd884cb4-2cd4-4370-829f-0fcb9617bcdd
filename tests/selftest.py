@@ -32,6 +32,7 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from threading import Thread
 
 CHECKS = 0
 FAILURES = []
@@ -434,12 +435,196 @@ def phase_c(app1, app2):
     expect("DELETE", app2, f"/services/{svc_ids[0]}", None, 409, "C5 delete referenced svc rejected after enable")
 
 
+# --------------------------------------------------------------------------- #
+# Phase D: WAL checkpointing under long reads, concurrency and dual processes
+# --------------------------------------------------------------------------- #
+
+def _wal_status(port):
+    st, js = req("GET", port, "/wal/status")
+    assert st == 200, js
+    return js
+
+
+def _checkpoint(port, mode="TRUNCATE", wait_ms=5000):
+    st, js = req("POST", port, "/wal/checkpoint",
+                 {"mode": mode, "wait_ms": wait_ms})
+    assert st == 200, js
+    return js
+
+
+def _seed_writes(port, other, n):
+    """Spread valid writes across both processes; needs an existing service 1."""
+    for i in range(n):
+        target = port if i % 2 == 0 else other
+        st, _ = req("POST", target, "/deployments", {"service_id": 1, "note": f"w{i}"})
+        assert st == 201, st
+
+
+def phase_d(app1, app2):
+    print("== Phase D: WAL checkpoint (long read / bounded wait / dual process) ==")
+
+    expect("POST", app1, "/demo/reset", None, 200, "D0 reset")
+    expect("POST", app1, "/services", {"name": "wal-svc"}, 201, "D0 seed service")["id"]
+    expect("POST", app2, "/validation/start", None, 200, "D0 start validation (triggers on)")
+    expect("POST", app1, "/validation/finalize", None, 200, "D0 finalize (constraint enabled)")
+
+    # D1: read-only status reflects the on-disk WAL and never errors.
+    js = _wal_status(app1)
+    check(js["journal_mode"] == "wal", "D1 journal_mode=wal")
+    check(isinstance(js["wal_size_bytes"], int) and js["wal_size_bytes"] >= 0, "D1 wal_size reported")
+    check(js["truncated"] == (js["wal_size_bytes"] == 0), "D1 truncated flag matches wal size")
+
+    # D2: a truncate with no readers ends truncated and never reports retained.
+    # Short-lived writer connections may already have auto-checkpointed the WAL,
+    # so this does not assume the WAL is non-empty beforehand; it asserts the
+    # end state and the space-released accounting instead.
+    _seed_writes(app1, app2, 30)
+    before = _wal_status(app2)
+    check(before["wal_size_bytes"] >= 0, "D2 WAL size readable after writes")
+    js = _checkpoint(app1, "TRUNCATE", 5000)
+    check(js["outcome"] == "truncated", "D2 clean checkpoint outcome=truncated")
+    check(js["truncated"] is True and js["snapshot_retained"] is False, "D2 truncated, nothing retained")
+    check(js["after"]["wal_size_bytes"] == 0, "D2 WAL truncated to zero bytes")
+    check(js["space_released_bytes"] == before["wal_size_bytes"], "D2 released bytes match pre-checkpoint WAL")
+
+    # D3: long reader pins an old snapshot; checkpoint reports retained, and
+    # backfilled frames are NOT confused with released space. A held writer
+    # keeps its frames in the WAL; frames written before the reader are
+    # backfillable, frames written after stay pinned by the snapshot.
+    st, _ = req("POST", app1, "/demo/held-writer",
+                {"service_id": 1, "count": 40, "hold_seconds": 30})
+    check(st == 202, "D3 held writer (pre-snapshot frames kept in WAL)")
+    time.sleep(0.8)  # let the writer commit and leave its frames in the WAL
+    expect("POST", app1, "/wal/long-read", {"hold_seconds": 25}, 202, "D3 long read started (app1)")
+    time.sleep(0.5)
+    st, _ = req("POST", app2, "/demo/held-writer",
+                {"service_id": 1, "count": 40, "hold_seconds": 20})
+    check(st == 202, "D3 held writer on app2 (post-snapshot frames)")
+    time.sleep(0.8)
+    held = _wal_status(app2)
+    check(held["wal_size_bytes"] > 0 and (held["wal_frames"] or 0) > 0,
+          f"D3 WAL retains frames during long read ({held['wal_frames']} frames, {held['wal_size_bytes']} bytes)")
+
+    # D3a: zero-wait truncate must return immediately, busy, not truncated.
+    t0 = time.monotonic()
+    js = _checkpoint(app2, "TRUNCATE", 0)
+    dt = time.monotonic() - t0
+    check(js["outcome"] == "busy", f"D3a zero-wait checkpoint outcome=busy (got {js['outcome']})")
+    check(js["busy"] is True, "D3a busy flag set")
+    check(js["truncated"] is False, "D3a WAL not truncated while snapshot held")
+    check(js["snapshot_retained"] is True, "D3a snapshot_retained=true (old snapshot still occupies)")
+    check(js["space_released_bytes"] == 0, "D3a no disk space released despite any backfill")
+    check(js["after"]["wal_size_bytes"] == held["wal_size_bytes"], "D3a WAL bytes unchanged")
+    check(dt < 2.0, f"D3a zero-wait returned promptly ({dt:.2f}s)")
+
+    # D3b: bounded wait is honored (waits ~wait_ms) then reports timeout, still
+    # without releasing space.
+    wait_ms = 1200
+    t0 = time.monotonic()
+    js = _checkpoint(app1, "TRUNCATE", wait_ms)
+    dt = time.monotonic() - t0
+    check(js["outcome"] == "timeout", "D3b contended checkpoint outcome=timeout")
+    check(js["snapshot_retained"] is True and js["truncated"] is False, "D3b still retained, not truncated")
+    check(js["space_released_bytes"] == 0, "D3b timeout released zero bytes")
+    check(dt * 1000 >= wait_ms * 0.9, f"D3b waited at least ~{wait_ms}ms ({dt*1000:.0f}ms)")
+    check(dt < wait_ms / 1000 + 3.0, "D3b did not wait far beyond the cap")
+
+    # D3c: the key distinction — frames CAN be copied back into the main DB
+    # (frames_backfilled > 0) while the on-disk WAL stays fully occupied and
+    # zero bytes are released. PASSIVE never waits and never truncates.
+    js = _checkpoint(app2, "PASSIVE", 0)
+    check(js["outcome"] == "checkpointed", "D3c PASSIVE completes without waiting")
+    check(js["frames_backfilled"] > 0,
+          f"D3c frames were backfilled into the main DB ({js['frames_backfilled']})")
+    check(js["space_released_bytes"] == 0, "D3c backfilling released NO disk space")
+    check(js["truncated"] is False, "D3c PASSIVE does not truncate")
+    check((js["after"]["wal_frames"] or 0) > 0, "D3c WAL frames still physically present after backfill")
+
+    # D4: ordinary writes during the held snapshot + checkpoint contention stay
+    # fast (never stretched to the 30s write busy_timeout) and keep succeeding.
+    t0 = time.monotonic()
+    latencies = []
+    ok = 0
+    for i in range(12):
+        w0 = time.monotonic()
+        st, _ = req("POST", app2 if i % 2 else app1, "/deployments",
+                    {"service_id": 1, "note": f"during-hold-{i}"})
+        latencies.append(time.monotonic() - w0)
+        if st == 201:
+            ok += 1
+    write_elapsed = time.monotonic() - t0
+    check(ok == 12, "D4 all concurrent writes accepted during long read/checkpoint")
+    check(max(latencies) < 5.0, f"D4 no write blocked near 30s timeout (max {max(latencies):.2f}s)")
+    check(write_elapsed < 10.0, f"D4 write batch finished well under write timeout ({write_elapsed:.2f}s)")
+
+    # D5: referential constraint still enforced on both processes.
+    st, _ = req("POST", app1, "/deployments", {"service_id": 999999})
+    check(st == 409, "D5 orphan insert rejected on app1 (FK triggers intact)")
+    st, _ = req("POST", app2, "/deployments", {"service_id": 999999})
+    check(st == 409, "D5 orphan insert rejected on app2 (FK triggers intact)")
+
+    # D6: wait for the long reader to finish; re-checkpoint now truncates and a
+    # re-query reports the CURRENT on-disk truth (no stale "retained").
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        st, holders = req("GET", app1, "/wal/long-read")
+        if not holders["holders_on_this_process"]:
+            break
+        time.sleep(0.5)
+    st, holders = req("GET", app1, "/wal/long-read")
+    check(not holders["holders_on_this_process"], "D6 long reader released")
+    js = _checkpoint(app2, "TRUNCATE", 5000)
+    check(js["outcome"] == "truncated" and js["truncated"] is True, "D6 truncate succeeds after reader ends")
+    check(js["snapshot_retained"] is False, "D6 no false retained report once reader gone")
+    check(js["after"]["wal_size_bytes"] == 0, "D6 WAL back to zero bytes")
+    again = _wal_status(app1)
+    check(again["wal_size_bytes"] == 0 and again["truncated"] is True,
+          "D6 status re-query reflects current truncated state")
+
+    # D7: two processes fire checkpoints at the same time; neither hangs past
+    # its cap and the database ends in a consistent (truncated) state.
+    _seed_writes(app1, app2, 50)
+    results = {}
+
+    def fire(name, port):
+        results[name] = _checkpoint(port, "TRUNCATE", 4000)
+
+    threads = [threading.Thread(target=fire, args=("app1", app1)),
+               Thread(target=fire, args=("app2", app2))]
+    t0 = time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    dual_elapsed = time.monotonic() - t0
+    check(all(not t.is_alive() for t in threads), "D7 both concurrent checkpoints returned (no infinite lock wait)")
+    check(dual_elapsed < 12.0, f"D7 dual checkpoints finished bounded ({dual_elapsed:.2f}s)")
+    r1, r2 = results["app1"], results["app2"]
+    check({r1["outcome"], r2["outcome"]} <= {"truncated", "busy", "timeout"},
+          f"D7 outcomes valid ({r1['outcome']}, {r2['outcome']})")
+    final = _wal_status(app1)
+    check(final["wal_size_bytes"] == 0 or r1["snapshot_retained"] or r2["snapshot_retained"],
+          "D7 WAL truncated or explicitly reported retained — never silently stuck")
+    # A follow-up checkpoint with no reader always converges to truncated.
+    js = _checkpoint(app1, "TRUNCATE", 5000)
+    check(js["outcome"] == "truncated" and js["after"]["wal_size_bytes"] == 0,
+          "D7 follow-up checkpoint converges to truncated")
+
+    # D8: validation cap is enforced by the API (wait_ms above the cap -> 422).
+    st, js = req("POST", app1, "/wal/checkpoint", {"mode": "TRUNCATE", "wait_ms": 999999})
+    check(st == 422, f"D8 wait_ms above cap rejected ({st})")
+    st, js = req("POST", app1, "/wal/checkpoint", {"mode": "NOPE", "wait_ms": 100})
+    check(st == 422, f"D8 invalid mode rejected ({st})")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--app1", type=int, default=8001)
     parser.add_argument("--app2", type=int, default=8002)
     parser.add_argument("--restart-hook", default=None,
                         help="shell command that restarts the app1 process")
+    parser.add_argument("--skip-phase", action="append", default=[],
+                        help="phase letter to skip (A/B/C/D), repeatable")
     args = parser.parse_args()
 
     print(f"targets: app1=:{args.app1} app2=:{args.app2}")
@@ -449,9 +634,14 @@ def main():
         print("processes not reachable; aborting")
         sys.exit(1)
 
-    phase_a(args.app1, args.app2)
-    phase_b(args.app1, args.app2, args.restart_hook)
-    phase_c(args.app1, args.app2)
+    if "A" not in args.skip_phase:
+        phase_a(args.app1, args.app2)
+    if "B" not in args.skip_phase:
+        phase_b(args.app1, args.app2, args.restart_hook)
+    if "C" not in args.skip_phase:
+        phase_c(args.app1, args.app2)
+    if "D" not in args.skip_phase:
+        phase_d(args.app1, args.app2)
 
     print(f"\n{CHECKS} checks, {len(FAILURES)} failures")
     if FAILURES:

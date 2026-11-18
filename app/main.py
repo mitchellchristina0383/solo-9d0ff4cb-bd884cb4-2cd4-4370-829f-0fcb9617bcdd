@@ -41,8 +41,12 @@ Invariants
   can never be in an "enabled but orphans exist" state.
 """
 
+import enum
 import os
 import sqlite3
+import struct
+import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 
@@ -51,6 +55,17 @@ from pydantic import BaseModel, Field
 
 DB_PATH = os.environ.get("DB_PATH", "data/app.db")
 SERVER_NAME = os.environ.get("SERVER_NAME", "app")
+
+# Upper bound for the checkpoint request's own lock wait. It stays strictly
+# below the 30 s busy_timeout of ordinary write connections (see ``connect``),
+# so a stuck checkpoint can never delay a normal write up to the write timeout.
+CHECKPOINT_WAIT_CAP_MS = 25_000
+# A checkpoint waits this long at most; readers are re-probed with a zero
+# timeout so the probe itself never blocks.
+WAL_HEADER_SIZE = 32
+WAL_FRAME_HEADER_SIZE = 24
+# SQLite WAL magic numbers (big-endian / little-endian checksum variants).
+WAL_MAGICS = {0x377F0682, 0x377F0683}
 
 SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS services (
@@ -150,7 +165,181 @@ def immediate_txn(conn: sqlite3.Connection):
     conn.execute("COMMIT")
 
 
+# --------------------------------------------------------------------------- #
+# WAL observation / checkpoint helpers
+# --------------------------------------------------------------------------- #
+
+class CheckpointMode(str, enum.Enum):
+    # Values are the exact SQLite pragma keywords; never interpolate raw input.
+    passive = "PASSIVE"
+    full = "FULL"
+    restart = "RESTART"
+    truncate = "TRUNCATE"
+
+
+def _file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def read_wal_frames() -> dict:
+    """Parse the WAL file header to count frames WITHOUT touching the database.
+
+    A read-only filesystem inspection: it takes no lock and runs no SQL, so
+    GET /wal/status cannot itself change the database or the WAL. A WAL file is
+    a 32-byte header followed by (24-byte frame header + page) per frame; the
+    page size lives at header offset 8 (value 1 encodes 65536).
+    """
+    wal_path = DB_PATH + "-wal"
+    size = _file_size(wal_path)
+    info = {"wal_exists": size > 0, "wal_size_bytes": size,
+            "wal_frames": None, "wal_page_size": None, "wal_header_valid": None}
+    if size == 0:
+        info["wal_frames"] = 0
+        return info
+    try:
+        with open(wal_path, "rb") as fh:
+            header = fh.read(WAL_HEADER_SIZE)
+    except OSError:
+        return info
+    if len(header) < WAL_HEADER_SIZE:
+        return info
+    magic = struct.unpack(">I", header[0:4])[0]
+    if magic not in WAL_MAGICS:
+        info["wal_header_valid"] = False
+        return info
+    page_size = struct.unpack(">I", header[8:12])[0]
+    if page_size == 1:
+        page_size = 65536
+    info["wal_header_valid"] = True
+    info["wal_page_size"] = page_size
+    info["wal_frames"] = max(0, (size - WAL_HEADER_SIZE) // (WAL_FRAME_HEADER_SIZE + page_size))
+    return info
+
+
+def wal_snapshot() -> dict:
+    """Current on-disk WAL state plus the DB journal mode. Read-only."""
+    db_size = _file_size(DB_PATH)
+    shm_size = _file_size(DB_PATH + "-shm")
+    info = read_wal_frames()
+    conn = connect()
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
+    return {
+        "journal_mode": mode,
+        "db_size_bytes": db_size,
+        "shm_size_bytes": shm_size,
+        **info,
+        "truncated": info["wal_size_bytes"] == 0,
+    }
+
+
+def run_checkpoint(mode: CheckpointMode, wait_ms: int) -> dict:
+    """Run one bounded checkpoint and report what actually happened.
+
+    SQLite contract (verified on 3.40.x): ``PRAGMA wal_checkpoint`` does NOT
+    raise on lock contention — it returns a row ``(busy, log, checkpointed)``.
+    ``busy=1`` means some lock/snapshot could not be acquired; the
+    ``busy_timeout`` we install on this *dedicated* connection still bounds how
+    long the pragma blocks, so a concurrent request can never wait forever nor
+    inherit the 30 s timeout of ordinary write connections.
+
+    ``checkpointed`` counts frames copied back into the main DB. It is NOT the
+    same as disk freed: only a successful TRUNCATE returns WAL bytes to the
+    filesystem, and a long-lived reader can keep old frames (and the bytes)
+    occupied even after every frame was copied back.
+    """
+    conn = connect()
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {int(wait_ms)}")
+        before = wal_snapshot()
+        started = time.monotonic()
+        try:
+            busy, log_frames, checkpointed_frames = conn.execute(
+                f"PRAGMA wal_checkpoint({mode.value})"
+            ).fetchone()
+            error = None
+        except sqlite3.OperationalError as exc:
+            # Defensive: some SQLite builds surface SQLITE_BUSY as an error.
+            busy, log_frames, checkpointed_frames = 1, -1, -1
+            error = str(exc)
+        waited_ms = round((time.monotonic() - started) * 1000, 1)
+        after = wal_snapshot()
+    finally:
+        conn.close()
+
+    # A zero-timeout PASSIVE on a fresh connection is a non-blocking diagnostic:
+    # it reports how many frames are copyable right now without waiting. It is
+    # NOT used to decide retention — a fresh connection has a newer read mark and
+    # may not see the old snapshot that actually pins the frames.
+    probe = connect()
+    try:
+        probe.execute("PRAGMA busy_timeout = 0")
+        probe_busy, probe_log, probe_checkpointed = probe.execute(
+            "PRAGMA wal_checkpoint(PASSIVE)"
+        ).fetchone()
+    finally:
+        probe.close()
+
+    frames_backfilled = checkpointed_frames if checkpointed_frames >= 0 else 0
+    space_released_bytes = max(0, before["wal_size_bytes"] - after["wal_size_bytes"])
+    # "Truncated" means the WAL holds no bytes afterwards (a zero-length or
+    # absent WAL). An already-empty WAL before the call stays empty, so that is
+    # also a truncated/clean end state rather than a failure.
+    truncated = after["wal_size_bytes"] == 0
+    # The authoritative "still occupied" signal: the checkpoint itself could not
+    # finish (busy=1) AND frames still physically remain in the WAL. This holds
+    # whether the blocker is a long-lived reader's old snapshot or the writer;
+    # either way the on-disk space is NOT released. We deliberately do not treat
+    # copied-back frames (frames_backfilled) as freed space.
+    snapshot_retained = bool(busy == 1 and (after["wal_frames"] or 0) > 0)
+
+    if not busy and (mode != CheckpointMode.truncate or truncated):
+        outcome = "truncated" if mode == CheckpointMode.truncate else "checkpointed"
+    elif error is not None:
+        outcome = "error"
+    elif wait_ms > 0 and waited_ms >= wait_ms * 0.9:
+        # The caller asked to wait and the pragma used essentially the whole
+        # budget without acquiring what it needed: a bounded timeout.
+        outcome = "timeout"
+    else:
+        outcome = "busy"
+
+    return {
+        "mode": mode.value,
+        "requested_wait_ms": wait_ms,
+        "waited_ms": waited_ms,
+        "outcome": outcome,
+        "busy": bool(busy),
+        "error": error,
+        "frames_in_wal_reported": log_frames,
+        "frames_checkpointed_reported": checkpointed_frames,
+        "frames_backfilled": frames_backfilled,
+        "snapshot_retained": snapshot_retained,
+        "truncated": truncated,
+        "space_released_bytes": space_released_bytes,
+        "probe_busy": bool(probe_busy),
+        "probe_frames_in_wal": probe_log,
+        "probe_frames_checkpointed": probe_checkpointed,
+        "before": before,
+        "after": after,
+    }
+
+
+# A process-lifetime idle connection. Real services keep a connection pool open;
+# without any open connection SQLite deletes the -wal file on last-close, which
+# would make the on-disk WAL flicker out of existence between requests. This
+# idle connection holds no transaction (so it pins no snapshot and blocks no
+# checkpoint) but keeps the WAL file present for stable observation.
+_keepalive: sqlite3.Connection | None = None
+
+
 def init_db() -> None:
+    global _keepalive
     directory = os.path.dirname(os.path.abspath(DB_PATH))
     os.makedirs(directory, exist_ok=True)
     conn = connect()
@@ -171,12 +360,17 @@ def init_db() -> None:
                 conn.execute(ddl)
     finally:
         conn.close()
+    _keepalive = connect()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    yield
+    try:
+        yield
+    finally:
+        if _keepalive is not None:
+            _keepalive.close()
 
 
 app = FastAPI(
@@ -562,6 +756,127 @@ def validation_findings():
 
 
 # --------------------------------------------------------------------------- #
+# WAL checkpointing (disk reclamation while two processes keep reading/writing)
+# --------------------------------------------------------------------------- #
+
+# Tracks deliberately held read transactions (the long-read repro). The dict
+# is process-local: it only bookkeeps THIS process's holders. A connection may
+# only be used by the thread that created it (sqlite3 default), so the holder
+# connection is created and destroyed inside the worker thread; this dict only
+# keeps the tokens of live holders. Keeping the connection OPEN is also what
+# keeps the -wal file present: SQLite deletes the WAL when the last connection
+# closes.
+_locks_guard = threading.Lock()
+_locks_held: set[str] = set()
+
+
+@app.get("/wal/status")
+def wal_status():
+    """Read-only view of the WAL on disk. Runs no checkpoint and takes no DB
+    lock, so it never mutates the database and is safe to poll during a long
+    read. Frame counts are parsed from the WAL file header."""
+    return {"served_by": SERVER_NAME, **wal_snapshot()}
+
+
+class CheckpointBody(BaseModel):
+    mode: CheckpointMode = Field(
+        default=CheckpointMode.truncate,
+        description="PASSIVE copies what it can; FULL waits for readers; "
+        "RESTART also restarts the WAL; TRUNCATE additionally truncates the "
+        "WAL to zero bytes (the only mode that returns disk space).",
+    )
+    wait_ms: int = Field(
+        default=5000,
+        ge=0,
+        le=CHECKPOINT_WAIT_CAP_MS,
+        description="Upper bound on lock/snapshot waiting for THIS request. "
+        "Capped below the 30 s busy_timeout used by ordinary write connections, "
+        "so checkpoint contention can never stretch a normal write to its timeout.",
+    )
+
+
+@app.post("/wal/checkpoint")
+def wal_checkpoint(body: CheckpointBody | None = None):
+    """Checkpoint the WAL with a bounded wait.
+
+    Always returns 200 with the progress made so far — including on timeout or
+    contention — because SQLite may already have copied frames back even when
+    it could not truncate. Read ``outcome`` / ``truncated`` /
+    ``snapshot_retained`` rather than assuming success:
+
+    * ``truncated``        — TRUNCATE completed; WAL bytes were returned.
+    * ``checkpointed``     — non-truncate mode completed its copy.
+    * ``busy``             — a reader/writer blocked completion immediately.
+    * ``timeout``          — waited up to ``wait_ms`` and still could not finish.
+    * ``error``            — unexpected database error (message in ``error``).
+
+    ``frames_backfilled`` is progress into the main DB; it is NOT disk freed.
+    When ``snapshot_retained`` is true a long-lived reader still pins old WAL
+    frames, so the space stays occupied until that reader ends — re-checkpoint
+    afterwards. Re-query GET /wal/status for the current on-disk truth.
+    """
+    body = body or CheckpointBody()
+    result = run_checkpoint(body.mode, body.wait_ms)
+    return {"served_by": SERVER_NAME, **result}
+
+
+class LongReadBody(BaseModel):
+    hold_seconds: float = Field(
+        default=10.0, gt=0, le=120.0,
+        description="How long the read transaction stays open, pinning the snapshot.",
+    )
+    token: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/wal/long-read", status_code=202)
+def wal_long_read(body: LongReadBody):
+    """Open a read transaction and keep it (and its snapshot) open in a
+    background thread for ``hold_seconds``. The connection is created inside
+    that thread and stays open for the whole hold, which both pins the WAL
+    snapshot and keeps the -wal file present. While held, a TRUNCATE checkpoint
+    can copy frames back but cannot truncate: the response reports
+    ``snapshot_retained=true``. GET /wal/long-read shows this process's holders."""
+    token = body.token or f"lr-{utcnow()}-{threading.get_ident()}"
+    hold_seconds = body.hold_seconds
+
+    def hold():
+        # Dedicated connection created AND used in this same thread; kept open
+        # until the sleep ends so its read mark pins old WAL frames.
+        conn = connect()
+        try:
+            conn.execute("BEGIN")
+            conn.execute("SELECT COUNT(*) FROM deployments").fetchone()
+            time.sleep(hold_seconds)
+        except sqlite3.Error:
+            pass
+        finally:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            conn.close()
+            with _locks_guard:
+                _locks_held.discard(token)
+
+    with _locks_guard:
+        _locks_held.add(token)
+    threading.Thread(target=hold, daemon=True).start()
+    return {
+        "served_by": SERVER_NAME,
+        "token": token,
+        "hold_seconds": hold_seconds,
+        "detail": "snapshot held; POST /wal/checkpoint now reports snapshot_retained until it ends",
+    }
+
+
+@app.get("/wal/long-read")
+def wal_long_read_status():
+    with _locks_guard:
+        holders = sorted(_locks_held)
+    return {"served_by": SERVER_NAME, "holders_on_this_process": holders}
+
+
+# --------------------------------------------------------------------------- #
 # demo / ops
 # --------------------------------------------------------------------------- #
 
@@ -593,6 +908,100 @@ def demo_reset():
         conn.close()
 
 
+class BulkWriteBody(BaseModel):
+    service_id: int
+    count: int = Field(default=50, ge=1, le=5000)
+    note: str = "bulk"
+
+
+@app.post("/demo/bulk-write", status_code=201)
+def demo_bulk_write(body: BulkWriteBody):
+    """Insert ``count`` deployments in ONE transaction on ONE connection.
+
+    SQLite auto-checkpoints and deletes an empty WAL when a connection closes,
+    so ordinary one-request-per-row writes leave little to observe. For the WAL
+    repro use POST /demo/held-writer instead, which keeps the writer connection
+    open; this endpoint is a simple batched insert and the FK triggers apply."""
+    conn = connect()
+    try:
+        try:
+            with immediate_txn(conn):
+                first_id = None
+                for i in range(body.count):
+                    cur = conn.execute(
+                        "INSERT INTO deployments (service_id, note) VALUES (?, ?)",
+                        (body.service_id, f"{body.note}-{i}"),
+                    )
+                    if first_id is None:
+                        first_id = cur.lastrowid
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail=f"refused: {exc}")
+        return {"served_by": SERVER_NAME, "inserted": body.count, "first_id": first_id}
+    finally:
+        conn.close()
+
+
+# Held writer connections for the long-read/WAL repro. A connection is only
+# usable from its creating thread, so each holder owns a worker thread that
+# keeps the connection (and its un-checkpointed WAL frames) open.
+_writers_guard = threading.Lock()
+_writers_held: set[str] = set()
+
+
+class HeldWriterBody(BaseModel):
+    hold_seconds: float = Field(default=15.0, gt=0, le=120.0)
+    count: int = Field(default=40, ge=1, le=2000,
+                       description="rows written on the held connection before it idles")
+    service_id: int = 1
+    token: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/demo/held-writer", status_code=202)
+def demo_held_writer(body: HeldWriterBody):
+    """Open a writer connection, write ``count`` rows, then keep the connection
+    OPEN (idle, transaction committed) for ``hold_seconds``. Because it never
+    closes, the written frames remain in the WAL instead of being reaped — the
+    building block for a mid-WAL snapshot. Combine with POST /wal/long-read to
+    reproduce 'frames backfilled but space not released'."""
+    token = body.token or f"hw-{utcnow()}-{threading.get_ident()}"
+    hold_seconds, count, service_id = body.hold_seconds, body.count, body.service_id
+
+    def hold():
+        conn = connect()
+        try:
+            with immediate_txn(conn):
+                for i in range(count):
+                    conn.execute(
+                        "INSERT INTO deployments (service_id, note) VALUES (?, ?)",
+                        (service_id, f"held-{i}"),
+                    )
+            # connection stays open and idle; its WAL frames are not reaped
+            time.sleep(hold_seconds)
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+            with _writers_guard:
+                _writers_held.discard(token)
+
+    with _writers_guard:
+        _writers_held.add(token)
+    threading.Thread(target=hold, daemon=True).start()
+    return {
+        "served_by": SERVER_NAME,
+        "token": token,
+        "hold_seconds": hold_seconds,
+        "written": count,
+        "detail": "writer connection held open; its frames stay in the WAL",
+    }
+
+
+@app.get("/demo/held-writer")
+def demo_held_writer_status():
+    with _writers_guard:
+        return {"served_by": SERVER_NAME, "holders_on_this_process": sorted(_writers_held)}
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "served_by": SERVER_NAME}
@@ -611,5 +1020,10 @@ def index():
             "GET /orphans, PATCH /deployments/{id} to correct",
             "POST /validation/finalize",
             "GET /validation/status",
+        ],
+        "wal_ops": [
+            "GET /wal/status (WAL file size / frames / truncated, read-only)",
+            "POST /wal/checkpoint {mode, wait_ms} (bounded reclaim, reports progress even when blocked)",
+            "POST /wal/long-read {hold_seconds} (repro: pin an old snapshot)",
         ],
     }
